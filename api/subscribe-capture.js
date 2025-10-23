@@ -1,4 +1,4 @@
-// api/subscribe-capture.js  (versión REST, robusta y con mensajes claros)
+// api/subscribe-capture.js  — REST + mapeo de provincias AR + errores detallados
 
 function setCORS(res, origin) {
   res.setHeader("Access-Control-Allow-Origin", origin);
@@ -15,15 +15,57 @@ function normalizePhone(arPhone) {
   return `+${digits}`;
 }
 
+// Provincias AR aceptadas por Shopify (nombre + province_code)
+const AR_PROVINCES = [
+  { code: "C", name: "Ciudad Autónoma de Buenos Aires", aliases: ["caba","capital federal","ciudad autonoma de buenos aires","capital"] },
+  { code: "B", name: "Buenos Aires", aliases: ["bs as","buenos aires"] },
+  { code: "K", name: "Catamarca", aliases: ["catamarca"] },
+  { code: "H", name: "Chaco", aliases: ["chaco"] },
+  { code: "U", name: "Chubut", aliases: ["chubut"] },
+  { code: "X", name: "Córdoba", aliases: ["cordoba","córdoba"] },
+  { code: "W", name: "Corrientes", aliases: ["corrientes"] },
+  { code: "E", name: "Entre Ríos", aliases: ["entre rios","entre ríos"] },
+  { code: "P", name: "Formosa", aliases: ["formosa"] },
+  { code: "Y", name: "Jujuy", aliases: ["jujuy"] },
+  { code: "L", name: "La Pampa", aliases: ["la pampa"] },
+  { code: "F", name: "La Rioja", aliases: ["la rioja"] },
+  { code: "M", name: "Mendoza", aliases: ["mendoza"] },
+  { code: "N", name: "Misiones", aliases: ["misiones"] },
+  { code: "Q", name: "Neuquén", aliases: ["neuquen","neuquén"] },
+  { code: "R", name: "Río Negro", aliases: ["rio negro","río negro"] },
+  { code: "A", name: "Salta", aliases: ["salta"] },
+  { code: "J", name: "San Juan", aliases: ["san juan"] },
+  { code: "D", name: "San Luis", aliases: ["san luis"] },
+  { code: "Z", name: "Santa Cruz", aliases: ["santa cruz"] },
+  { code: "S", name: "Santa Fe", aliases: ["santa fe"] },
+  { code: "G", name: "Santiago del Estero", aliases: ["santiago del estero"] },
+  { code: "V", name: "Tierra del Fuego", aliases: ["tierra del fuego"] },
+  { code: "T", name: "Tucumán", aliases: ["tucuman","tucumán"] },
+];
+
+// Devuelve { code, name } a partir de lo que escribió el usuario
+function mapARProvince(input) {
+  if (!input) return null;
+  const s = String(input).toLowerCase().trim();
+  for (const p of AR_PROVINCES) {
+    if (p.aliases.includes(s) || p.name.toLowerCase() === s || p.code.toLowerCase() === s) {
+      return { code: p.code, name: p.name };
+    }
+  }
+  // fallback: si puso CABA, Capital, etc.
+  if (/^(caba|capital( federal)?)$/.test(s)) {
+    return { code: "C", name: "Ciudad Autónoma de Buenos Aires" };
+  }
+  return null; // dejemos que Shopify nos diga si no calza
+}
+
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
   const allowList = (process.env.ALLOWED_ORIGINS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+    .split(",").map(s => s.trim()).filter(Boolean);
   const isAllowed = allowList.length === 0 || allowList.includes(origin);
 
-  setCORS(res, isAllowed ? origin : allowList[0] || "*");
+  setCORS(res, isAllowed ? origin : (allowList[0] || "*"));
   if (req.method === "OPTIONS") return res.status(200).end();
   if (!isAllowed) return res.status(403).json({ error: "Forbidden origin (CORS)" });
   if (req.method !== "POST") return res.status(405).json({ error: "Método no permitido" });
@@ -41,24 +83,32 @@ export default async function handler(req, res) {
 
   const safePhone = normalizePhone(phone);
 
+  // mapeo de provincia
+  let provName = province;
+  let provCode = undefined;
+  if ((country || "").toUpperCase() === "AR") {
+    const m = mapARProvince(province);
+    if (m) { provName = m.name; provCode = m.code; }
+  }
+
   const customerPayload = {
     customer: {
       email,
       first_name: firstName,
       last_name: lastName,
       phone: safePhone,
-      // Tags y nota para que lo veas fácil en Shopify
       tags: [
         "Suscripción MixPerfume",
         plan ? `Plan: ${plan}` : null,
-        categoria ? `Cat: ${categoria}` : null,
+        categoria ? `Cat: ${categoria}` : null
       ].filter(Boolean).join(", "),
       note: `Alta suscripción desde web — Plan: ${plan || "-"} | Cat: ${categoria || "-"} | Precio: ${price || "-"} | ${new Date().toLocaleString("es-AR")}`,
       addresses: [{
         address1,
         address2,
         city,
-        province,
+        province: provName,
+        province_code: provCode,  // ❤️ clave para AR
         zip,
         country,
         phone: safePhone,
@@ -86,7 +136,7 @@ export default async function handler(req, res) {
     return { status: resp.status, json, raw: text };
   }
 
-  // 1) Intentamos CREAR
+  // 1) Intentar CREAR
   const create = await shopify("/customers.json", {
     method: "POST",
     body: JSON.stringify(customerPayload)
@@ -96,14 +146,9 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, action: "created", customer: create.json.customer });
   }
 
-  // 2) Si ya existe (422 email taken), BUSCAMOS por email y ACTUALIZAMOS
-  const isAlreadyTaken =
-    create.status === 422 &&
-    (JSON.stringify(create.json || {}).toLowerCase().includes("email") &&
-     JSON.stringify(create.json || {}).toLowerCase().includes("taken"));
-
-  if (isAlreadyTaken) {
-    // Buscar ID por email
+  // 2) Si ya existe por email → BUSCAR + ACTUALIZAR
+  const looksTaken = create.status === 422 && JSON.stringify(create.json || {}).toLowerCase().includes("email");
+  if (looksTaken) {
     const search = await shopify(`/customers/search.json?query=${encodeURIComponent(`email:${email}`)}`);
     const found  = Array.isArray(search.json?.customers) ? search.json.customers[0] : null;
     if (!found?.id) {
@@ -117,16 +162,15 @@ export default async function handler(req, res) {
         last_name: lastName,
         phone: safePhone,
         note: customerPayload.customer.note,
-        // Mantenemos tags existentes + nuevos, sin duplicar
-        tags: Array.from(
-          new Set(
-            `${found.tags || ""}, ${customerPayload.customer.tags}`.split(",")
-              .map(t => t.trim())
-              .filter(Boolean)
-          )
-        ).join(", "),
+        tags: Array.from(new Set(
+          `${found.tags || ""}, ${customerPayload.customer.tags}`.split(",")
+            .map(t => t.trim()).filter(Boolean)
+        )).join(", "),
         addresses: [{
-          address1, address2, city, province, zip, country, phone: safePhone, default: true
+          address1, address2, city,
+          province: provName,
+          province_code: provCode,
+          zip, country, phone: safePhone, default: true
         }]
       }
     };
@@ -147,7 +191,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // 3) Otro error → devolvemos detalle para verlo en consola
+  // 3) Otro error: devolvemos el detalle completo que mandó Shopify
   return res.status(500).json({
     error: "No se pudo crear el cliente",
     request: customerPayload,
